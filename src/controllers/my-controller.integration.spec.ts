@@ -36,7 +36,7 @@ describe('MyController Integration Tests', () => {
 		await fastify.close();
 	});
 
-	it('ProcessOrderShouldReturn', async () => {
+	it('should process order with mixed product types successfully', async () => {
 		const client = supertest(fastify.server);
 		const allProducts = createProducts();
 		const orderId = await database.transaction(async tx => {
@@ -50,6 +50,97 @@ describe('MyController Integration Tests', () => {
 
 		const resultOrder = await database.query.orders.findFirst({where: eq(orders.id, orderId)});
 		expect(resultOrder!.id).toBe(orderId);
+
+		// Verify that notifications were sent appropriately
+		expect(notificationServiceMock.sendDelayNotification).toHaveBeenCalledWith(10, 'USB Dongle');
+		expect(notificationServiceMock.sendExpirationNotification).toHaveBeenCalled();
+		expect(notificationServiceMock.sendOutOfStockNotification).toHaveBeenCalledWith('Grapes');
+	});
+
+	it('should handle normal product with sufficient stock', async () => {
+		const client = supertest(fastify.server);
+		const testProducts = [
+			{
+				leadTime: 15, available: 10, type: 'NORMAL', name: 'USB Cable',
+			},
+		];
+
+		const orderId = await database.transaction(async tx => {
+			const productList = await tx.insert(products).values(testProducts).returning({productId: products.id});
+			const [order] = await tx.insert(orders).values([{}]).returning({orderId: orders.id});
+			await tx.insert(ordersToProducts).values(productList.map(p => ({orderId: order!.orderId, productId: p.productId})));
+			return order!.orderId;
+		});
+
+		await client.post(`/orders/${orderId}/processOrder`).expect(200);
+
+		// Verify stock was decreased
+		const updatedProduct = await database.query.products.findFirst({
+			where: (products, {eq}) => eq(products.id, 1),
+		});
+		expect(updatedProduct?.available).toBe(9);
+		expect(notificationServiceMock.sendDelayNotification).not.toHaveBeenCalled();
+	});
+
+	it('should handle seasonal product in season', async () => {
+		const client = supertest(fastify.server);
+		const currentDate = new Date();
+		const testProducts = [
+			{
+				leadTime: 15,
+				available: 5,
+				type: 'SEASONAL',
+				name: 'Summer Fruit',
+				seasonStartDate: new Date(currentDate.getTime() - (10 * 24 * 60 * 60 * 1000)),
+				seasonEndDate: new Date(currentDate.getTime() + (50 * 24 * 60 * 60 * 1000)),
+			},
+		];
+
+		const orderId = await database.transaction(async tx => {
+			const productList = await tx.insert(products).values(testProducts).returning({productId: products.id});
+			const [order] = await tx.insert(orders).values([{}]).returning({orderId: orders.id});
+			await tx.insert(ordersToProducts).values(productList.map(p => ({orderId: order!.orderId, productId: p.productId})));
+			return order!.orderId;
+		});
+
+		await client.post(`/orders/${orderId}/processOrder`).expect(200);
+
+		// Verify stock was decreased
+		const updatedProduct = await database.query.products.findFirst({
+			where: (products, {eq}) => eq(products.id, 1),
+		});
+		expect(updatedProduct?.available).toBe(4);
+		expect(notificationServiceMock.sendOutOfStockNotification).not.toHaveBeenCalled();
+	});
+
+	it('should handle expirable product that is not expired', async () => {
+		const client = supertest(fastify.server);
+		const currentDate = new Date();
+		const testProducts = [
+			{
+				leadTime: 15,
+				available: 3,
+				type: 'EXPIRABLE',
+				name: 'Fresh Milk',
+				expiryDate: new Date(currentDate.getTime() + (10 * 24 * 60 * 60 * 1000)),
+			},
+		];
+
+		const orderId = await database.transaction(async tx => {
+			const productList = await tx.insert(products).values(testProducts).returning({productId: products.id});
+			const [order] = await tx.insert(orders).values([{}]).returning({orderId: orders.id});
+			await tx.insert(ordersToProducts).values(productList.map(p => ({orderId: order!.orderId, productId: p.productId})));
+			return order!.orderId;
+		});
+
+		await client.post(`/orders/${orderId}/processOrder`).expect(200);
+
+		// Verify stock was decreased
+		const updatedProduct = await database.query.products.findFirst({
+			where: (products, {eq}) => eq(products.id, 1),
+		});
+		expect(updatedProduct?.available).toBe(2);
+		expect(notificationServiceMock.sendExpirationNotification).not.toHaveBeenCalled();
 	});
 
 	function createProducts(): ProductInsert[] {
